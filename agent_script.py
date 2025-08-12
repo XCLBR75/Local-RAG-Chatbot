@@ -3,11 +3,7 @@ from retrieval import setup_tools_async, create_agent
 from langchain.llms import Ollama as LangchainOllama
 import gc, socket, asyncio
 
-datasets = [
-    ("data/customs.gov.sg-Major Exporter Scheme (1).pdf", "singapore_tax"),
-    ("data/cat-facts.txt", "cat_facts"),
-    ("data/Interpretable Time-Series Few-shot.pdf", "DPSN_fewshotlearning_time_series"),
-]
+datasets = []
 
 vectorstores = {}
 weaviate_clients = []
