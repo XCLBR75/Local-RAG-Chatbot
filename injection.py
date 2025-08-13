@@ -1,7 +1,10 @@
 import os
 import logging
 import uuid
-from typing import Tuple, Dict
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple, Dict, List, Optional
 from dotenv import load_dotenv
 import weaviate
 from weaviate.classes.init import Auth
@@ -13,21 +16,201 @@ from PyPDF2 import PdfReader
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
+# -----------------------------------------------------------------------------
+# Setup
+# -----------------------------------------------------------------------------
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 executor = ThreadPoolExecutor()
 
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+
 def deterministic_id(text: str) -> str:
+    """Stable UUID based on the text payload.
+    We use uuid5 (namespace-based) so the same text always maps to the same id.
+    """
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, text))
 
-def load_text(file_path: str) -> list[str]:
-    if file_path.endswith(".pdf"):
-        reader = PdfReader(file_path)
-        text = "\n".join([page.extract_text() or "" for page in reader.pages])
-        return [line.strip() for line in text.splitlines() if line.strip()]
-    else:
-        with open(file_path, encoding="utf-8") as f:
-            return [line.strip() for line in f if line.strip()]
+
+def _estimate_tokens(text: str) -> int:
+    """Very rough token estimator.
+    Approximate tokens as ~1.3 * words. Good enough for chunk sizing.
+    """
+    words = len(text.split())
+    return max(1, int(words * 1.3))
+
+
+def _normalize_page_text(raw: str) -> str:
+    """Normalize raw PDF-extracted text while keeping paragraph boundaries.
+    """
+    if not raw:
+        return ""
+
+    t = raw.replace("\r\n", "\n").replace("\r", "\n")
+    # Merge hyphenated line breaks
+    t = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", t)
+    # Replace single newlines inside paragraphs with space
+    t = re.sub(r"(?<!\n)\n(?!\n)", " ", t)
+    # Collapse excessive whitespace
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split text into sentences based on punctuation and plausible sentence starts."""
+    if not text:
+        return []
+    # Split on . ! ? followed by whitespace and a plausible sentence start
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(\"])", text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+@dataclass
+class Chunk:
+    content: str
+    page: Optional[int]
+    index: int  # index within page (for PDFs) or file (for text files)
+    tokens: int
+    source: str
+
+
+def _chunk_sentences(
+    sentences: List[str],
+    max_tokens: int = 400,
+    overlap_tokens: int = 60,
+) -> List[Chunk]:
+    """Greedy sentence-level chunking with sliding-window overlap.
+
+    - Accumulates sentences until adding the next one would exceed max_tokens.
+    - Emits a chunk, then starts the next with an overlap of ~overlap_tokens
+      worth of trailing sentences from the previous chunk.
+    """
+    chunks: List[Chunk] = []
+    if not sentences:
+        return chunks
+
+    current: List[str] = []
+    current_tokens = 0
+    running_index = 0
+
+    for sent in sentences:
+        t = _estimate_tokens(sent)
+        if current and current_tokens + t > max_tokens:
+            content = " ".join(current).strip()
+            chunks.append(Chunk(content=content, page=None, index=running_index,
+                                 tokens=_estimate_tokens(content), source=""))
+            running_index += 1
+            # Build overlap window from the tail of current
+            overlap: List[str] = []
+            acc = 0
+            for s in reversed(current):
+                acc += _estimate_tokens(s)
+                overlap.insert(0, s)
+                if acc >= overlap_tokens:
+                    break
+            current = overlap + [sent]
+            current_tokens = sum(_estimate_tokens(s) for s in current)
+        else:
+            current.append(sent)
+            current_tokens += t
+
+    if current:
+        content = " ".join(current).strip()
+        chunks.append(Chunk(content=content, page=None, index=running_index,
+                             tokens=_estimate_tokens(content), source=""))
+
+    return chunks
+
+
+def pdf_to_chunks(
+    file_path: str,
+    max_tokens: int = 400,
+    overlap_tokens: int = 60,
+) -> List[Chunk]:
+    """Convert a PDF into semantic-ish chunks with page metadata.
+
+    Returns a list of Chunk(content, page, index, tokens, source).
+    """
+    reader = PdfReader(file_path)
+    source = Path(file_path).name
+    all_chunks: List[Chunk] = []
+
+    for pageno, page in enumerate(reader.pages, start=1):
+        raw = page.extract_text() or ""
+        norm = _normalize_page_text(raw)
+        if not norm:
+            continue
+        sents = _split_sentences(norm)
+        page_chunks = _chunk_sentences(sents, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
+        # Fill page & source metadata and re-index within the page
+        for idx, ch in enumerate(page_chunks):
+            all_chunks.append(Chunk(
+                content=ch.content,
+                page=pageno,
+                index=idx,
+                tokens=ch.tokens,
+                source=source,
+            ))
+
+    return all_chunks
+
+
+def semantic_textfile_to_chunks(file_path: str, max_tokens: int = 120, overlap_tokens: int = 20):
+    """Fine-grained semantic chunking for fact-style .txt files.
+    
+    - Each sentence as its own unit.
+    - Merge until hitting a small max token size (default 120).
+    - Keeps small overlaps for context.
+    """
+    with open(file_path, encoding="utf-8") as f:
+        raw = f.read()
+
+    # Normalize formatting
+    norm = _normalize_page_text(raw)
+
+    # Break into individual sentences/facts
+    facts = re.split(r"(?:\n\s*\n|^- |\.\s+)", norm)
+    facts = [f.strip() for f in facts if f.strip()]
+
+    # Chunk in a greedy fashion
+    chunks = []
+    current = []
+    current_tokens = 0
+    idx = 0
+    for fact in facts:
+        t = _estimate_tokens(fact)
+        if current and current_tokens + t > max_tokens:
+            # emit chunk
+            content = " ".join(current)
+            chunks.append(Chunk(content=content, page=None, index=idx, 
+                                tokens=_estimate_tokens(content), source=Path(file_path).name))
+            idx += 1
+            # overlap
+            overlap = []
+            acc = 0
+            for s in reversed(current):
+                acc += _estimate_tokens(s)
+                overlap.insert(0, s)
+                if acc >= overlap_tokens:
+                    break
+            current = overlap + [fact]
+            current_tokens = sum(_estimate_tokens(s) for s in current)
+        else:
+            current.append(fact)
+            current_tokens += t
+
+    if current:
+        content = " ".join(current)
+        chunks.append(Chunk(content=content, page=None, index=idx, 
+                            tokens=_estimate_tokens(content), source=Path(file_path).name))
+
+    return chunks
+
+
+
 
 async def async_exists(collection, uid: str) -> bool:
     loop = asyncio.get_event_loop()
@@ -37,16 +220,38 @@ async def async_exists(collection, uid: str) -> bool:
         logging.warning(f"Exist check failed for {uid}: {e}")
         return False
 
-async def inject_dataset(file_path: str, topic: str) -> Tuple[Dict[str, WeaviateVectorStore], weaviate.WeaviateClient]:
-    lines = load_text(file_path)
-    logging.info(f"Loaded {len(lines)} lines from {file_path}")
 
+async def inject_dataset(
+    file_path: str,
+    topic: str,
+    chunk_tokens: int = 400,
+    overlap_tokens: int = 60,
+) -> Tuple[Dict[str, WeaviateVectorStore], weaviate.WeaviateClient]:
+    """Extracts, chunks, deduplicates, and upserts content into Weaviate.
+
+    - For PDFs, performs page-aware sentence chunking with overlap.
+    - For text files, performs sentence chunking across the whole file.
+    - Uses deterministic UUIDs for idempotent deduplication.
+    """
+    is_pdf = file_path.lower().endswith('.pdf')
+
+    if is_pdf:
+        chunks = pdf_to_chunks(file_path, max_tokens=chunk_tokens, overlap_tokens=overlap_tokens)
+    else:
+        chunks = semantic_textfile_to_chunks(file_path, max_tokens=chunk_tokens, overlap_tokens=overlap_tokens)
+
+    logging.info(
+        f"Prepared {len(chunks)} chunks from '{file_path}' (chunk≈{chunk_tokens} tokens, overlap≈{overlap_tokens})."
+    )
+
+    # Connect to Weaviate
     client = weaviate.connect_to_weaviate_cloud(
         cluster_url=os.getenv("WEAVIATE_URL"),
         auth_credentials=Auth.api_key(os.getenv("WEAVIATE_API_KEY")),
     )
     assert client.is_ready(), "Weaviate not ready"
 
+    # Ensure collection exists with metadata fields we plan to write
     try:
         collection = client.collections.get(topic)
         logging.info(f"Using existing collection '{topic}'")
@@ -54,36 +259,54 @@ async def inject_dataset(file_path: str, topic: str) -> Tuple[Dict[str, Weaviate
         logging.info(f"Collection '{topic}' does not exist — creating it.")
         collection = client.collections.create(
             name=topic,
-            properties=[{"name": "content", "dataType": "text"}],
+            properties=[
+                {"name": "content", "dataType": "text"},
+                {"name": "source", "dataType": "text"},
+                {"name": "page", "dataType": "int"},
+                {"name": "chunk", "dataType": "int"},
+                {"name": "tokens", "dataType": "int"},
+            ],
             vectorizer_config=Configure.Vectorizer.none(),
         )
 
     embedding = OllamaEmbedding("nomic-embed-text")
-    vectorstore = WeaviateVectorStore(client=client, index_name=topic, text_key="content", embedding=embedding)
+    vectorstore = WeaviateVectorStore(
+        client=client, index_name=topic, text_key="content", embedding=embedding
+    )
 
+    # Prepare async exists checks for idempotent upsert
     tasks = []
-    uids = []
-    for line in lines:
-        uid = deterministic_id(line)
+    packed: List[Tuple[Chunk, str]] = []
+    for ch in chunks:
+        # Include file, page, and chunk index in the ID seed to avoid cross-file collisions
+        id_seed = f"{ch.source}|p{ch.page if ch.page is not None else 0}|c{ch.index}|{ch.content}"
+        uid = deterministic_id(id_seed)
         tasks.append(async_exists(collection, uid))
-        uids.append((line, uid))
+        packed.append((ch, uid))
 
     results = await asyncio.gather(*tasks)
 
-    dedup_lines = []
-    dedup_ids = []
+    texts: List[str] = []
+    ids: List[str] = []
+    metadatas: List[Dict] = []
 
-    for (line, uid), exists in zip(uids, results):
+    for (ch, uid), exists in zip(packed, results):
         if not exists:
-            dedup_lines.append(line)
-            dedup_ids.append(uid)
+            texts.append(ch.content)
+            ids.append(uid)
+            metadatas.append({
+                "source": ch.source,
+                "page": ch.page if ch.page is not None else -1,
+                "chunk": ch.index,
+                "tokens": ch.tokens,
+            })
         else:
             logging.debug(f"Skipped duplicate: {uid}")
 
-    if dedup_lines:
-        vectorstore.add_texts(texts=dedup_lines, ids=dedup_ids)
-        logging.info(f"Injected {len(dedup_lines)} new records.")
+    if texts:
+        vectorstore.add_texts(texts=texts, ids=ids, metadatas=metadatas)
+        logging.info(f"Injected {len(texts)} new chunks (skipped {len(chunks) - len(texts)} duplicates).")
     else:
-        logging.info("No new lines to inject — all items existed already.")
+        logging.info("No new chunks to inject — all items existed already.")
 
     return {topic: vectorstore}, client

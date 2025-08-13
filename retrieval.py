@@ -7,6 +7,39 @@ from langchain.agents.output_parsers import ReActSingleInputOutputParser
 from langchain.vectorstores.base import VectorStore
 from langchain.tools.tavily_search import TavilySearchResults
 from langchain.llms import Ollama as LangchainOllama
+from langchain.schema import AgentAction, AgentFinish
+
+
+FAILED_ACTIONS = []
+MAX_FAILURES = 3  
+
+class ForgivingReActParser(ReActSingleInputOutputParser):
+    def parse(self, text: str):
+        try:
+            return super().parse(text)
+        except Exception:
+           
+            if "Final Answer:" in text:
+                final_text = text.split("Final Answer:")[-1].strip()
+                return AgentFinish(return_values={"output": final_text}, log=text)
+
+            if "Action:" in text and "Action Input:" in text:
+                action = text.split("Action:")[1].split("\n")[0].strip()
+                action_input = text.split("Action Input:")[1].split("\n")[0].strip().strip('"')
+
+                if (action, action_input) not in FAILED_ACTIONS:
+                    FAILED_ACTIONS.append((action, action_input))
+
+                if len(FAILED_ACTIONS) >= MAX_FAILURES:
+                    return AgentFinish(
+                        return_values={"output": "ERROR — Too many failed tool attempts. Stopping."},
+                        log=text
+                    )
+
+                return AgentAction(tool=action, tool_input=action_input, log=text)
+
+            # Absolute last resort: return the whole text as the final output
+            return AgentFinish(return_values={"output": text.strip()}, log=text)
 
 
 def setup_tools_async(vectorstores: Dict[str, VectorStore]):
@@ -33,7 +66,6 @@ def setup_tools_async(vectorstores: Dict[str, VectorStore]):
         )
         tools.append(retriever_tool)
         
-    # Tavily search tool (async wrapper)
     async def clean_tavily_output_async(query: str) -> str:
         raw_results = await TavilySearchResults().ainvoke(query)
         if isinstance(raw_results, list):
@@ -42,7 +74,6 @@ def setup_tools_async(vectorstores: Dict[str, VectorStore]):
             )
         return str(raw_results)
 
-    # Sync wrapper to await async function
     def clean_tavily_output_sync(query: str) -> str:
         return asyncio.run(clean_tavily_output_async(query))
 
@@ -58,16 +89,24 @@ def setup_tools_async(vectorstores: Dict[str, VectorStore]):
 
 def create_agent(tools):
     llm = LangchainOllama(model="openhermes", temperature=0.1, top_p=0.7)
-    output_parser = ReActSingleInputOutputParser()
+    output_parser = ForgivingReActParser()
+
+    failure_memory_text = ""
+    if FAILED_ACTIONS:
+        failure_memory_text = "\nYou already tried the following actions and they failed:\n"
+        for tool, inp in FAILED_ACTIONS:
+            failure_memory_text += f'- {tool}("{inp}")\n'
+        failure_memory_text += "Do not attempt them again.\n"
 
     return initialize_agent(
         tools=tools,
         llm=llm,
         agent=AgentType.CHAT_ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
-        handle_parsing_errors=True,
+        handle_parsing_errors=False,
         agent_kwargs={
             "system_message": (
+                failure_memory_text +
                 "You are a highly disciplined and rule-bound assistant that MUST follow this format:\n"
                 "Here is the conversation so far:\n{chat_history}\n\n"
                 "Absolutely NO deviations, no summaries, and no creative liberties are allowed. This is MANDATORY:\n\n"
