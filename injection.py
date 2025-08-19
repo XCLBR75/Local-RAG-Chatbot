@@ -15,17 +15,13 @@ from embeddings import OllamaEmbedding
 from PyPDF2 import PdfReader
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from pdf_mcp_server.mcp_client import mcp_parse_pdf
 
-# -----------------------------------------------------------------------------
-# Setup
-# -----------------------------------------------------------------------------
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 executor = ThreadPoolExecutor()
 
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
 
 def deterministic_id(text: str) -> str:
     """Stable UUID based on the text payload.
@@ -35,15 +31,15 @@ def deterministic_id(text: str) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Very rough token estimator.
-    Approximate tokens as ~1.3 * words. Good enough for chunk sizing.
+    """Token estimator.
+    Approximate tokens as ~1.3 * words.
     """
     words = len(text.split())
     return max(1, int(words * 1.3))
 
 
 def _normalize_page_text(raw: str) -> str:
-    """Normalize raw PDF-extracted text while keeping paragraph boundaries.
+    """Normalize PDF-extracted text while keeping paragraph boundaries.
     """
     if not raw:
         return ""
@@ -53,17 +49,16 @@ def _normalize_page_text(raw: str) -> str:
     t = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", t)
     # Replace single newlines inside paragraphs with space
     t = re.sub(r"(?<!\n)\n(?!\n)", " ", t)
-    # Collapse excessive whitespace
+    # Collapse whitespaces
     t = re.sub(r"[ \t]{2,}", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
 
 def _split_sentences(text: str) -> List[str]:
-    """Split text into sentences based on punctuation and plausible sentence starts."""
+    """Split text into sentences based on punctuation and sentence starts."""
     if not text:
         return []
-    # Split on . ! ? followed by whitespace and a plausible sentence start
     parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(\"])", text)
     return [p.strip() for p in parts if p and p.strip()]
 
@@ -72,7 +67,7 @@ def _split_sentences(text: str) -> List[str]:
 class Chunk:
     content: str
     page: Optional[int]
-    index: int  # index within page (for PDFs) or file (for text files)
+    index: int  
     tokens: int
     source: str
 
@@ -103,7 +98,7 @@ def _chunk_sentences(
             chunks.append(Chunk(content=content, page=None, index=running_index,
                                  tokens=_estimate_tokens(content), source=""))
             running_index += 1
-            # Build overlap window from the tail of current
+            # Build overlap window 
             overlap: List[str] = []
             acc = 0
             for s in reversed(current):
@@ -125,35 +120,67 @@ def _chunk_sentences(
     return chunks
 
 
-def pdf_to_chunks(
+async def pdf_to_chunks_async(
     file_path: str,
     max_tokens: int = 400,
     overlap_tokens: int = 60,
+    use_mcp: bool = False,
 ) -> List[Chunk]:
-    """Convert a PDF into semantic-ish chunks with page metadata.
-
-    Returns a list of Chunk(content, page, index, tokens, source).
-    """
-    reader = PdfReader(file_path)
+    """Async version of pdf_to_chunks that can handle MCP parsing properly."""
     source = Path(file_path).name
     all_chunks: List[Chunk] = []
 
-    for pageno, page in enumerate(reader.pages, start=1):
-        raw = page.extract_text() or ""
-        norm = _normalize_page_text(raw)
-        if not norm:
-            continue
-        sents = _split_sentences(norm)
-        page_chunks = _chunk_sentences(sents, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
-        # Fill page & source metadata and re-index within the page
-        for idx, ch in enumerate(page_chunks):
-            all_chunks.append(Chunk(
-                content=ch.content,
-                page=pageno,
-                index=idx,
-                tokens=ch.tokens,
-                source=source,
-            ))
+    if use_mcp:
+        # Use MCP server for PDF parsing
+        try:
+            result = await mcp_parse_pdf(file_path)
+            pdf_chunks = result.get('chunks', [])
+            
+            for chunk_data in pdf_chunks:
+                page_num = chunk_data.get('page', 1)
+                raw_text = chunk_data.get('text', '')
+                
+                norm = _normalize_page_text(raw_text)
+                if not norm:
+                    continue
+                
+                sents = _split_sentences(norm)
+                page_chunks = _chunk_sentences(sents, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
+               
+                for idx, ch in enumerate(page_chunks):
+                    all_chunks.append(Chunk(
+                        content=ch.content,
+                        page=page_num,
+                        index=idx,
+                        tokens=ch.tokens,
+                        source=source,
+                    ))
+                    
+        except Exception as e:
+            logging.warning(f"MCP parsing failed for {file_path}, falling back to PyPDF2: {e}")
+            # Fall back to PyPDF2 if MCP fails
+            use_mcp = False
+    
+    if not use_mcp:
+        # Use PyPDF2 for PDF parsing
+        reader = PdfReader(file_path)
+        
+        for pageno, page in enumerate(reader.pages, start=1):
+            raw = page.extract_text() or ""
+            norm = _normalize_page_text(raw)
+            if not norm:
+                continue
+            sents = _split_sentences(norm)
+            page_chunks = _chunk_sentences(sents, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
+           
+            for idx, ch in enumerate(page_chunks):
+                all_chunks.append(Chunk(
+                    content=ch.content,
+                    page=pageno,
+                    index=idx,
+                    tokens=ch.tokens,
+                    source=source,
+                ))
 
     return all_chunks
 
@@ -168,14 +195,10 @@ def semantic_textfile_to_chunks(file_path: str, max_tokens: int = 120, overlap_t
     with open(file_path, encoding="utf-8") as f:
         raw = f.read()
 
-    # Normalize formatting
     norm = _normalize_page_text(raw)
-
-    # Break into individual sentences/facts
     facts = re.split(r"(?:\n\s*\n|^- |\.\s+)", norm)
     facts = [f.strip() for f in facts if f.strip()]
 
-    # Chunk in a greedy fashion
     chunks = []
     current = []
     current_tokens = 0
@@ -210,8 +233,6 @@ def semantic_textfile_to_chunks(file_path: str, max_tokens: int = 120, overlap_t
     return chunks
 
 
-
-
 async def async_exists(collection, uid: str) -> bool:
     loop = asyncio.get_event_loop()
     try:
@@ -226,22 +247,31 @@ async def inject_dataset(
     topic: str,
     chunk_tokens: int = 400,
     overlap_tokens: int = 60,
+    use_mcp_parser: bool = False,
 ) -> Tuple[Dict[str, WeaviateVectorStore], weaviate.WeaviateClient]:
     """Extracts, chunks, deduplicates, and upserts content into Weaviate.
 
     - For PDFs, performs page-aware sentence chunking with overlap.
     - For text files, performs sentence chunking across the whole file.
     - Uses deterministic UUIDs for idempotent deduplication.
+    
+    Args:
+        file_path: Path to the file to process
+        topic: Topic name for the Weaviate collection
+        chunk_tokens: Maximum tokens per chunk
+        overlap_tokens: Number of tokens to overlap between chunks
+        use_mcp_parser: If True, use MCP server for PDF parsing
     """
     is_pdf = file_path.lower().endswith('.pdf')
 
     if is_pdf:
-        chunks = pdf_to_chunks(file_path, max_tokens=chunk_tokens, overlap_tokens=overlap_tokens)
+        chunks = await pdf_to_chunks_async(file_path, max_tokens=chunk_tokens, overlap_tokens=overlap_tokens, use_mcp=use_mcp_parser)
     else:
         chunks = semantic_textfile_to_chunks(file_path, max_tokens=chunk_tokens, overlap_tokens=overlap_tokens)
 
+    parser_method = "MCP server" if use_mcp_parser and is_pdf else "PyPDF2/direct"
     logging.info(
-        f"Prepared {len(chunks)} chunks from '{file_path}' (chunk≈{chunk_tokens} tokens, overlap≈{overlap_tokens})."
+        f"Prepared {len(chunks)} chunks from '{file_path}' using {parser_method} (chunk≈{chunk_tokens} tokens, overlap≈{overlap_tokens})."
     )
 
     # Connect to Weaviate
@@ -256,7 +286,7 @@ async def inject_dataset(
         collection = client.collections.get(topic)
         logging.info(f"Using existing collection '{topic}'")
     except WeaviateBaseError:
-        logging.info(f"Collection '{topic}' does not exist — creating it.")
+        logging.info(f"Collection '{topic}' does not exist – creating it.")
         collection = client.collections.create(
             name=topic,
             properties=[
@@ -274,11 +304,9 @@ async def inject_dataset(
         client=client, index_name=topic, text_key="content", embedding=embedding
     )
 
-    # Prepare async exists checks for idempotent upsert
     tasks = []
     packed: List[Tuple[Chunk, str]] = []
     for ch in chunks:
-        # Include file, page, and chunk index in the ID seed to avoid cross-file collisions
         id_seed = f"{ch.source}|p{ch.page if ch.page is not None else 0}|c{ch.index}|{ch.content}"
         uid = deterministic_id(id_seed)
         tasks.append(async_exists(collection, uid))
@@ -307,6 +335,6 @@ async def inject_dataset(
         vectorstore.add_texts(texts=texts, ids=ids, metadatas=metadatas)
         logging.info(f"Injected {len(texts)} new chunks (skipped {len(chunks) - len(texts)} duplicates).")
     else:
-        logging.info("No new chunks to inject — all items existed already.")
+        logging.info("No new chunks to inject – all items existed already.")
 
     return {topic: vectorstore}, client

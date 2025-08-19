@@ -1,8 +1,7 @@
 import os
 import streamlit as st
 from PIL import Image
-from agent_script import agent, llm, close_resources
-
+from agent_script import agent, llm, close_resources, USE_MCP_PARSER, reload_datasets_with_parser
 
 # === Page Config ===
 st.set_page_config(page_title="RAG Chatbot", layout="centered")
@@ -14,11 +13,12 @@ if "avatars" not in st.session_state:
         "bot": Image.open("images/chatbot.jpg").resize((40, 40)),
     }
 
-# === Initialize history ===
 if "messages" not in st.session_state:
     st.session_state.messages = []  
 
-# === Helper to add messages ===
+if "current_parser" not in st.session_state:
+    st.session_state.current_parser = USE_MCP_PARSER
+
 def add_message(sender, text):
     st.session_state.messages.append({"sender": sender, "text": text})
 
@@ -46,8 +46,74 @@ def get_bot_response(query):
 
     return response
 
-# === Chat display ===
+# === Sidebar Configuration ===
+st.sidebar.title("⚙️ Configuration")
+
+# PDF Parser Selection
+st.sidebar.subheader("PDF Parser")
+current_parser_display = "MCP Server" if st.session_state.current_parser else "PyPDF2"
+st.sidebar.write(f"Current parser: **{current_parser_display}**")
+
+new_parser = st.sidebar.radio(
+    "Select PDF Parser:",
+    options=[False, True],
+    format_func=lambda x: "PyPDF2 (Default)" if not x else "MCP Server",
+    index=int(st.session_state.current_parser),
+    help="Choose between PyPDF2 (default) and MCP Server for PDF parsing. Note: Changing this will reload all datasets."
+)
+
+# Handle parser change
+if new_parser != st.session_state.current_parser:
+    with st.sidebar:
+        with st.spinner("Deleting existing collections and reloading datasets with new parser..."):
+            try:
+                # Progress bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                status_text.text("Cleaning up existing resources...")
+                progress_bar.progress(20)
+                
+                status_text.text("Deleting collections...")
+                progress_bar.progress(40)
+                
+                status_text.text("Reloading datasets with new parser...")
+                progress_bar.progress(60)
+                
+                reload_datasets_with_parser(new_parser)
+                
+                progress_bar.progress(100)
+                status_text.text("Complete!")
+                
+                st.session_state.current_parser = new_parser
+                st.success(f"Successfully switched to {'MCP Server' if new_parser else 'PyPDF2'} parser!")
+                st.info("Collections were deleted and recreated with the new parser.")
+                
+                # Clear chat history when switching parsers
+                st.session_state.messages = []
+                
+                # Clean progress indicators
+                progress_bar.empty()
+                status_text.empty()
+                
+            except Exception as e:
+                st.error(f"Failed to switch parser: {str(e)}")
+                st.error("You may need to restart the application if collections are in an inconsistent state.")
+                # Clean progress indicators on error as well
+                try:
+                    progress_bar.empty()
+                    status_text.empty()
+                except:
+                    pass
+
+# === Main Chat Interface ===
 st.title("🤖 RAG Chatbot")
+
+# Show current parser in main area
+parser_info = "🔧 Using **MCP Server** for PDF parsing" if st.session_state.current_parser else "🔧 Using **PyPDF2** for PDF parsing"
+st.info(parser_info)
+
+# === Chat display ===
 prev_sender = None
 
 for msg in st.session_state.messages:
@@ -87,8 +153,7 @@ for msg in st.session_state.messages:
         if is_user:
             st.image(avatar_img, width=40, use_container_width=False)
 
-
-
+    prev_sender = msg["sender"]
 
 # === User input ===
 query = st.chat_input("Type your message...")
@@ -104,7 +169,6 @@ if "pending_query" in st.session_state:
     st.session_state.messages[-1]["text"] = get_bot_response(query_to_process)
     st.rerun()
 
-
 # === Shutdown hook ===
 def shutdown():
     try:
@@ -117,4 +181,3 @@ def shutdown():
         os._exit(0)  
 
 st.sidebar.button("🔴 Close App", on_click=shutdown)
-

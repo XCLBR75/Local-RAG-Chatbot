@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import Dict
 from langchain.tools import Tool
 from langchain.agents import initialize_agent
@@ -8,6 +9,10 @@ from langchain.vectorstores.base import VectorStore
 from langchain.tools.tavily_search import TavilySearchResults
 from langchain.llms import Ollama as LangchainOllama
 from langchain.schema import AgentAction, AgentFinish
+from pdf_mcp_server.mcp_client import mcp_summarize_pdf, mcp_search_pdf
+import requests
+
+from pdf_mcp_server.mcp_client import mcp_tavily_search
 
 
 FAILED_ACTIONS = []
@@ -42,7 +47,7 @@ class ForgivingReActParser(ReActSingleInputOutputParser):
             return AgentFinish(return_values={"output": text.strip()}, log=text)
 
 
-def setup_tools_async(vectorstores: Dict[str, VectorStore]):
+def setup_tools_async(vectorstores: Dict[str, VectorStore], datasets):
     tools = []
 
     for topic, vectorstore in vectorstores.items():
@@ -65,20 +70,50 @@ def setup_tools_async(vectorstores: Dict[str, VectorStore]):
             description=f"Use this to get information related to {topic.replace('-', ' ')}."
         )
         tools.append(retriever_tool)
-        
-    async def clean_tavily_output_async(query: str) -> str:
-        raw_results = await TavilySearchResults().ainvoke(query)
-        if isinstance(raw_results, list):
-            return "\n".join(
-                f"{item.get('title', '')}: {item.get('content', '')[:200]}..." for item in raw_results
-            )
-        return str(raw_results)
 
-    def clean_tavily_output_sync(query: str) -> str:
-        return asyncio.run(clean_tavily_output_async(query))
+    topic_to_file = {topic: fp for fp, topic in datasets}
+
+    for topic in topic_to_file.keys():
+        file_path = topic_to_file.get(topic)
+        async def search_pdf_async(query: str, fp=file_path) -> str:
+            result = await mcp_search_pdf(fp, query)
+            return json.dumps(result, ensure_ascii=False)
+
+        def search_pdf_sync(query: str, fp=file_path) -> str:
+            return asyncio.run(search_pdf_async(query, fp))
+
+        async def summarize_pdf_async(max_sentences: str, fp=file_path) -> str:
+            try:
+                max_sentences_int = int(max_sentences.strip())
+            except ValueError:
+                return "ERROR — Expected an integer for max_sentences"
+            result = await mcp_summarize_pdf(fp, max_sentences_int)
+            return json.dumps(result, ensure_ascii=False)
+
+        def summarize_pdf_sync(max_sentences: str, fp=file_path) -> str:
+            return asyncio.run(summarize_pdf_async(max_sentences, fp))
+        
+        tools.append(Tool.from_function(
+            func=search_pdf_sync,
+            name=f"{topic.capitalize()}SearchPDF",
+            description=f"Search for a query inside the PDF for topic '{topic}'. Input: query string."
+        ))
+        tools.append(Tool.from_function(
+            func=summarize_pdf_sync,
+            name=f"{topic.capitalize()}SummarizePDF",
+            description=f"Summarize the PDF for topic '{topic}'. Input: max sentences as integer."
+        ))
+        
+    async def tavily_async(query: str) -> str:
+        result = await mcp_tavily_search(query)
+        return json.dumps(result, ensure_ascii=False)
+
+
+    def tavily_sync(query: str) -> str:
+        return asyncio.run(tavily_async(query))
 
     tavily_tool = Tool.from_function(
-        func=clean_tavily_output_sync,
+        func=tavily_sync,
         name="TavilySearch",
         description="Useful for searching current events and today's news."
     )
